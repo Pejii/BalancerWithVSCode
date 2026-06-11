@@ -1,0 +1,17 @@
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "editor.fontSize": 14,
+    "editor.fontFamily": "Fira Code, Consolas, 'Courier New', monospace",
+    "editor.formatOnSave": true,
+    "files.defaultLanguage": "python"
+  },
+  "extensions": {
+    "recommendations": [
+      "GitHub.copilot",
+      "ms-python.python"
+    ]
+  }
+}
