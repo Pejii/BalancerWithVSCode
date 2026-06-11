@@ -1,6 +1,8 @@
 # Config files (student-specific, should not be committed)
 front.config.json
 back.config.json
+cf_front.config.json
+cf_back.config.json
 
 # Python artifacts
 __pycache__/
