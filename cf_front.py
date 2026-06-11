@@ -14,6 +14,7 @@ import threading
 import time
 import websocket
 from config import load_or_create_config
+from urllib.parse import urlparse, urlunparse
 
 DEFAULTS = {
     "Local_Host": "127.0.0.1",
@@ -55,18 +56,30 @@ def _next_session_id() -> int:
 
 
 def _build_worker_url() -> str:
-    url = WORKER_URL
-    if "?" in url:
-        return f"{url}&role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
-    return f"{url}?role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+    parsed = urlparse(WORKER_URL)
+    path = parsed.path or "/"
+    if path.endswith("/"):
+        path = path.rstrip("/") + "/ws"
+    elif not path.endswith("/ws"):
+        path = path + "/ws"
+
+    query = parsed.query
+    if query:
+        query = f"{query}&role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+    else:
+        query = f"role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+
+    return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, parsed.fragment))
 
 
 def _connect_worker():
     headers = []
     if WORKER_TOKEN:
         headers.append(f"X-Worker-Token: {WORKER_TOKEN}")
+    url = _build_worker_url()
+    url = url.replace("https://", "wss://").replace("http://", "ws://")
     options = {"cert_reqs": ssl.CERT_REQUIRED}
-    return websocket.create_connection(_build_worker_url(), header=headers, sslopt=options)
+    return websocket.create_connection(url, header=headers, sslopt=options)
 
 
 def _ws_receive_loop():

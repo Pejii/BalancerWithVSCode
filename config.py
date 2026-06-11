@@ -33,20 +33,34 @@ def load_or_create_config(path: str, defaults: Dict[str, Any]) -> Dict[str, Any]
                     data[k] = v
                     changed = True
             if changed:
-                _atomic_write(path, data)
+                print(f"[config] Updated {path} with missing default keys")
+                try:
+                    _atomic_write(path, data)
+                except Exception as write_err:
+                    print(f"[config] Failed to update {path}: {write_err}")
+            else:
+                print(f"[config] Loaded config from {path}")
             return data
-        except Exception:
+        except Exception as e:
             # corrupted file: back it up and recreate defaults
+            print(f"[config] Config file {path} corrupted ({e}), backing up and recreating with defaults")
             try:
                 os.replace(path, path + ".backup")
             except Exception:
                 pass
-            _atomic_write(path, defaults)
+            try:
+                _atomic_write(path, defaults)
+            except Exception as write_err:
+                print(f"[config] Failed to write defaults to {path}: {write_err}")
             return dict(defaults)
     else:
         # create parent dir if necessary
         parent = os.path.dirname(path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
-        _atomic_write(path, defaults)
+        print(f"[config] Config file {path} not found, created with defaults")
+        try:
+            _atomic_write(path, defaults)
+        except Exception as write_err:
+            print(f"[config] Failed to write config to {path}: {write_err}")
         return dict(defaults)

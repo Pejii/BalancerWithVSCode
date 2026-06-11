@@ -12,7 +12,12 @@ import ssl
 import struct
 import threading
 import time
-import websocket
+from urllib.parse import urlparse, urlunparse
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
 from config import load_or_create_config
 
 DEFAULTS = {
@@ -55,18 +60,34 @@ def _next_session_id() -> int:
 
 
 def _build_worker_url() -> str:
-    url = WORKER_URL
-    if "?" in url:
-        return f"{url}&role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
-    return f"{url}?role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+    parsed = urlparse(WORKER_URL)
+    path = parsed.path or "/"
+    if path.endswith("/"):
+        path = path.rstrip("/") + "/ws"
+    elif not path.endswith("/ws"):
+        path = path + "/ws"
+
+    query = parsed.query
+    if query:
+        query = f"{query}&role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+    else:
+        query = f"role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
+
+    return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, parsed.fragment))
 
 
 def _connect_worker():
+    if websocket is None:
+        raise RuntimeError("websocket-client is not installed in the active Python environment")
     headers = []
     if WORKER_TOKEN:
         headers.append(f"X-Worker-Token: {WORKER_TOKEN}")
+    url = _build_worker_url()
+    url = url.replace("https://", "wss://").replace("http://", "ws://")
     options = {"cert_reqs": ssl.CERT_REQUIRED}
-    return websocket.create_connection(_build_worker_url(), header=headers, sslopt=options)
+    if not hasattr(websocket, "create_connection"):
+        raise RuntimeError(f"Imported websocket module {websocket.__name__} from {getattr(websocket, '__file__', 'unknown')} does not support create_connection")
+    return websocket.create_connection(url, header=headers, sslopt=options)
 
 
 def _reset_ws():
