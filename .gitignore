@@ -43,6 +43,7 @@ env/
 # Project-specific directories (may contain student-generated data)
 pending/
 resolved/
+test/
 
 # Temporary files
 *.tmp
