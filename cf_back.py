@@ -14,10 +14,7 @@ import threading
 import time
 from urllib.parse import urlparse, urlunparse
 
-try:
-    import websocket
-except ImportError:
-    websocket = None
+import websocket
 from config import load_or_create_config
 
 DEFAULTS = {
@@ -47,6 +44,7 @@ _session_counter = 1
 ws = None
 ws_lock = threading.Lock()
 _ws_ready = threading.Event()
+_stop_event = threading.Event()
 
 
 def _next_session_id() -> int:
@@ -77,16 +75,12 @@ def _build_worker_url() -> str:
 
 
 def _connect_worker():
-    if websocket is None:
-        raise RuntimeError("websocket-client is not installed in the active Python environment")
     headers = []
     if WORKER_TOKEN:
         headers.append(f"X-Worker-Token: {WORKER_TOKEN}")
     url = _build_worker_url()
     url = url.replace("https://", "wss://").replace("http://", "ws://")
     options = {"cert_reqs": ssl.CERT_REQUIRED}
-    if not hasattr(websocket, "create_connection"):
-        raise RuntimeError(f"Imported websocket module {websocket.__name__} from {getattr(websocket, '__file__', 'unknown')} does not support create_connection")
     return websocket.create_connection(url, header=headers, sslopt=options)
 
 
@@ -103,7 +97,7 @@ def _reset_ws():
 
 def _ws_receive_loop():
     global ws
-    while True:
+    while not _stop_event.is_set():
         try:
             with ws_lock:
                 conn = ws
@@ -159,10 +153,14 @@ def _ws_receive_loop():
         except websocket.WebSocketConnectionClosedException:
             _ws_ready.clear()
             _reset_ws()
+            if _stop_event.is_set():
+                break
             time.sleep(2)
         except Exception:
             _ws_ready.clear()
             _reset_ws()
+            if _stop_event.is_set():
+                break
             time.sleep(2)
 
 

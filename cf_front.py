@@ -43,6 +43,7 @@ _session_counter = 1
 ws = None
 ws_lock = threading.Lock()
 _ws_ready = threading.Event()
+_stop_event = threading.Event()
 
 
 def _next_session_id() -> int:
@@ -84,7 +85,7 @@ def _connect_worker():
 
 def _ws_receive_loop():
     global ws
-    while True:
+    while not _stop_event.is_set():
         try:
             with ws_lock:
                 conn = ws
@@ -140,10 +141,14 @@ def _ws_receive_loop():
         except websocket.WebSocketConnectionClosedException:
             _ws_ready.clear()
             _reset_ws()
+            if _stop_event.is_set():
+                break
             time.sleep(2)
         except Exception:
             _ws_ready.clear()
             _reset_ws()
+            if _stop_event.is_set():
+                break
             time.sleep(2)
 
 
@@ -228,6 +233,7 @@ def _queue_worker_data(local_session_id: int, data: bytes):
 def _handle_socks5_client(client_sock: socket.socket, addr):
     session_id = None
     try:
+        client_sock.settimeout(1.0)
         ver_nmethods = client_sock.recv(2)
         if len(ver_nmethods) != 2 or ver_nmethods[0] != 5:
             client_sock.close()
@@ -264,8 +270,11 @@ def _handle_socks5_client(client_sock: socket.socket, addr):
 
         _send_open(session_id, dst_addr, dst_port)
 
-        while True:
-            chunk = client_sock.recv(MAX_CHUNK_SIZE)
+        while not _stop_event.is_set():
+            try:
+                chunk = client_sock.recv(MAX_CHUNK_SIZE)
+            except socket.timeout:
+                continue
             if not chunk:
                 break
             _queue_worker_data(session_id, chunk)
@@ -292,18 +301,34 @@ def _start_socks5_listener():
     server.bind((Local_Host, Local_Port))
     server.listen()
     print(f"[cf_front] SOCKS5 listener running on {Local_Host}:{Local_Port}")
-    while True:
-        client_sock, addr = server.accept()
-        threading.Thread(target=_handle_socks5_client, args=(client_sock, addr), daemon=True).start()
+    server.settimeout(1.0)
+    try:
+        while not _stop_event.is_set():
+            try:
+                client_sock, addr = server.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=_handle_socks5_client, args=(client_sock, addr), daemon=True).start()
+    finally:
+        try:
+            server.close()
+        except Exception:
+            pass
 
 
 def start():
     threading.Thread(target=_ws_receive_loop, daemon=True).start()
-    while not _ws_ready.is_set():
-        _ensure_worker_connection()
-        if not _ws_ready.is_set():
-            time.sleep(2)
-    _start_socks5_listener()
+    try:
+        while not _ws_ready.is_set() and not _stop_event.is_set():
+            _ensure_worker_connection()
+            if not _ws_ready.is_set():
+                time.sleep(2)
+        if not _stop_event.is_set():
+            _start_socks5_listener()
+    except KeyboardInterrupt:
+        print("[cf_front] KeyboardInterrupt received, shutting down")
+        _stop_event.set()
+        _reset_ws()
 
 
 if __name__ == "__main__":
