@@ -1,335 +1,292 @@
-"""Cloudflare frontend relay for BalancerWithVSCode.
+# This version is using cloudflare worker to pipe data between upstream proxies and the server
 
-This file opens a persistent WebSocket connection to Cloudflare Worker and
-hosts a local SOCKS5 listener on port 60000. Local SOCKS5 clients can use this
-as an upstream, and the worker forwards their traffic to the backend relay.
-"""
-
-import json
-import os
+import asyncio
 import socket
-import ssl
 import struct
-import threading
-import time
-import websocket
-from config import load_or_create_config
-from urllib.parse import urlparse, urlunparse
+import random
+import urllib.parse
+import collections
+import websockets
 
-DEFAULTS = {
-    "Local_Host": "127.0.0.1",
-    "Local_Port": 60000,
-    "worker_url": "https://your-worker.workers.dev/ws",
-    "worker_channel": "default",
-    "worker_token": "PUT_YOUR_WORKER_TOKEN_HERE",
-    "MAX_CHUNK_SIZE": 32768,
-}
+# Configuration Variables
+CHUNK_SIZE = 16384 # 65536 for fast connection, 16384 for slow connections
+CHUNKS_PER_WORKER = 5
+PACKET_FAILURE_TIMEOUT = 15.0
+LOCAL_LISTENER_HOST = "127.0.0.1"
+LOCAL_LISTENER_PORT = 1080
 
-_cf_defaults = DEFAULTS
-_cf_cfg = load_or_create_config("cf_front.config.json", _cf_defaults)
-Local_Host = _cf_cfg.get("Local_Host", _cf_defaults["Local_Host"])
-Local_Port = _cf_cfg.get("Local_Port", _cf_defaults["Local_Port"])
-WORKER_URL = _cf_cfg.get("worker_url", _cf_defaults["worker_url"])
-WORKER_CHANNEL = _cf_cfg.get("worker_channel", _cf_defaults["worker_channel"])
-WORKER_TOKEN = _cf_cfg.get("worker_token", _cf_defaults["worker_token"])
-MAX_CHUNK_SIZE = _cf_cfg.get("MAX_CHUNK_SIZE", _cf_defaults["MAX_CHUNK_SIZE"])
-WORKER_ROLE = "front"
+# Configuring relay
+CLOUDFLARE_BASE_URL = "wss://websocket-bridge-pipe.kolang-733.workers.dev/"
+DIRECT_BASE_URL = ""
 
-_sessions = {}
-_worker_session_map = {}
-_sessions_lock = threading.Lock()
-_session_counter = 1
+UPSTREAM_PROXIES = [
+    #("192.168.1.13", 1080, "cl1", "user123", "user123"),
+    #("192.168.1.17", 1080, "cl2", "user123", "user123"),
+    ("192.168.1.69", 15000, "cl1", "", ""),
+    ("192.168.1.70", 15000, "cl2", "", ""),
+]
 
-ws = None
-ws_lock = threading.Lock()
-_ws_ready = threading.Event()
-_stop_event = threading.Event()
+in_flight_chunks = {}
+active_connections = {}
+worker_semaphores = {}
 
 
-def _next_session_id() -> int:
-    global _session_counter
-    with _sessions_lock:
-        sid = _session_counter
-        _session_counter += 1
-        if _session_counter >= 2**31:
-            _session_counter = 1
-        return sid
+class Chunk:
+    def __init__(self, conn_id, cmd, seq_id, payload):
+        self.conn_id = conn_id
+        self.cmd = cmd
+        self.seq_id = seq_id
+        self.payload = payload
+        self.penalties = {}
 
 
-def _build_worker_url() -> str:
-    parsed = urlparse(WORKER_URL)
-    path = parsed.path or "/"
-    if path.endswith("/"):
-        path = path.rstrip("/") + "/ws"
-    elif not path.endswith("/ws"):
-        path = path + "/ws"
+class AsyncChunkQueue:
+    def __init__(self):
+        self._queue = collections.deque()
+        self._event = asyncio.Event()
 
-    query = parsed.query
-    if query:
-        query = f"{query}&role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
-    else:
-        query = f"role={WORKER_ROLE}&channel={WORKER_CHANNEL}"
-
-    return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, parsed.fragment))
-
-
-def _connect_worker():
-    headers = []
-    if WORKER_TOKEN:
-        headers.append(f"X-Worker-Token: {WORKER_TOKEN}")
-    url = _build_worker_url()
-    url = url.replace("https://", "wss://").replace("http://", "ws://")
-    options = {"cert_reqs": ssl.CERT_REQUIRED}
-    return websocket.create_connection(url, header=headers, sslopt=options)
-
-
-def _ws_receive_loop():
-    global ws
-    while not _stop_event.is_set():
-        try:
-            with ws_lock:
-                conn = ws
-            if conn is None:
-                time.sleep(1)
-                continue
-
-            message = conn.recv()
-            if isinstance(message, bytes):
-                if len(message) < 4:
-                    continue
-                worker_session_id = struct.unpack(">I", message[:4])[0]
-                payload = message[4:]
-                with _sessions_lock:
-                    local_session_id = _worker_session_map.get(worker_session_id)
-                    session = _sessions.get(local_session_id)
-                if session:
-                    try:
-                        session["socket"].sendall(payload)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    obj = json.loads(message)
-                except Exception:
-                    continue
-                msg_type = obj.get("type")
-                if msg_type == "assigned":
-                    client_id = obj.get("client_id")
-                    worker_session_id = obj.get("session_id")
-                    buffer = []
-                    with _sessions_lock:
-                        session = _sessions.get(client_id)
-                        if session is not None:
-                            session["worker_session_id"] = worker_session_id
-                            _worker_session_map[worker_session_id] = client_id
-                            buffer = session.get("buffer", [])
-                            session["buffer"] = []
-                    for chunk in buffer:
-                        _send_data(worker_session_id, chunk)
-                elif msg_type == "close":
-                    worker_session_id = obj.get("session_id")
-                    with _sessions_lock:
-                        local_session_id = _worker_session_map.pop(worker_session_id, None)
-                        session = _sessions.pop(local_session_id, None) if local_session_id is not None else None
-                    if session:
-                        try:
-                            session["socket"].close()
-                        except Exception:
-                            pass
-                elif msg_type == "error":
-                    print(f"[cf_front] Worker error: {obj.get('message')}")
-        except websocket.WebSocketConnectionClosedException:
-            _ws_ready.clear()
-            _reset_ws()
-            if _stop_event.is_set():
-                break
-            time.sleep(2)
-        except Exception:
-            _ws_ready.clear()
-            _reset_ws()
-            if _stop_event.is_set():
-                break
-            time.sleep(2)
-
-
-def _reset_ws():
-    global ws
-    with ws_lock:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-            ws = None
-
-
-def _ensure_worker_connection():
-    global ws
-    if _ws_ready.is_set():
-        return
-    with ws_lock:
-        if ws is None:
-            try:
-                ws = _connect_worker()
-                _ws_ready.set()
-                print(f"[cf_front] Connected to Cloudflare worker at {_build_worker_url()}")
-            except Exception as exc:
-                print(f"[cf_front] Worker connect failed: {exc}")
-                ws = None
-                _ws_ready.clear()
-                return
-
-
-def _send_open(local_session_id: int, dst_addr: str, dst_port: int):
-    body = json.dumps({
-        "type": "open",
-        "role": WORKER_ROLE,
-        "client_id": local_session_id,
-        "dst_addr": dst_addr,
-        "dst_port": dst_port,
-    })
-    with ws_lock:
-        if ws is not None:
-            ws.send(body)
-
-
-def _send_close(local_session_id: int):
-    with _sessions_lock:
-        session = _sessions.get(local_session_id)
-        if session is None:
-            return
-        worker_session_id = session.get("worker_session_id")
-
-    body = {"type": "close"}
-    if worker_session_id is not None:
-        body["session_id"] = worker_session_id
-    else:
-        body["client_id"] = local_session_id
-
-    with ws_lock:
-        if ws is not None:
-            ws.send(json.dumps(body))
-
-
-def _send_data(worker_session_id: int, data: bytes):
-    with ws_lock:
-        if ws is not None:
-            frame = struct.pack(">I", worker_session_id) + data
-            ws.send_binary(frame)
-
-
-def _queue_worker_data(local_session_id: int, data: bytes):
-    with _sessions_lock:
-        session = _sessions.get(local_session_id)
-        if session is None:
-            return
-        worker_session_id = session.get("worker_session_id")
-        if worker_session_id is not None:
-            _send_data(worker_session_id, data)
-            return
-        session.setdefault("buffer", []).append(data)
-
-
-def _handle_socks5_client(client_sock: socket.socket, addr):
-    session_id = None
-    try:
-        client_sock.settimeout(1.0)
-        ver_nmethods = client_sock.recv(2)
-        if len(ver_nmethods) != 2 or ver_nmethods[0] != 5:
-            client_sock.close()
-            return
-        nmethods = ver_nmethods[1]
-        methods = client_sock.recv(nmethods)
-        client_sock.sendall(b"\x05\x00")
-
-        hdr = client_sock.recv(4)
-        if len(hdr) != 4 or hdr[0] != 5 or hdr[1] != 1:
-            client_sock.close()
-            return
-        atyp = hdr[3]
-        if atyp == 1:
-            addr_bytes = client_sock.recv(4)
-            dst_addr = socket.inet_ntoa(addr_bytes)
-        elif atyp == 3:
-            dlen = client_sock.recv(1)[0]
-            dst_addr = client_sock.recv(dlen).decode("idna")
-        elif atyp == 4:
-            addr_bytes = client_sock.recv(16)
-            dst_addr = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+    async def put(self, chunk, front=False):
+        if front:
+            self._queue.appendleft(chunk)
         else:
-            client_sock.close()
+            self._queue.append(chunk)
+        self._event.set()
+
+    async def get(self, proxy_id):
+        while True:
+            if not self._queue:
+                self._event.clear()
+                await self._event.wait()
+                continue
+
+            now = asyncio.get_event_loop().time()
+            for chunk in self._queue:
+                if proxy_id in chunk.penalties and now < chunk.penalties[proxy_id]:
+                    continue
+                self._queue.remove(chunk)
+                return chunk
+            await asyncio.sleep(0.02)
+
+
+pending_queue = AsyncChunkQueue()
+
+
+def safe_release_semaphore(client_id):
+    sem = worker_semaphores.get(client_id)
+    if sem:
+        try:
+            sem.release()
+        except ValueError:
+            pass
+
+
+class ReassemblyBuffer:
+    def __init__(self, conn_id, write_callback, close_callback):
+        self.conn_id = conn_id
+        self.expected_seq = 0
+        self.buffer = {}
+        self.write_callback = write_callback
+        self.close_callback = close_callback
+
+    async def add_chunk(self, cmd, seq_id, payload):
+        if seq_id < self.expected_seq:
             return
-        port_bytes = client_sock.recv(2)
-        dst_port = int.from_bytes(port_bytes, "big")
 
-        client_sock.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        self.buffer[seq_id] = (cmd, payload)
 
-        session_id = _next_session_id()
-        with _sessions_lock:
-            _sessions[session_id] = {"socket": client_sock, "worker_session_id": None, "buffer": []}
-
-        _send_open(session_id, dst_addr, dst_port)
-
-        while not _stop_event.is_set():
+        while self.expected_seq in self.buffer:
+            curr_cmd, curr_payload = self.buffer.pop(self.expected_seq)
             try:
-                chunk = client_sock.recv(MAX_CHUNK_SIZE)
-            except socket.timeout:
-                continue
-            if not chunk:
-                break
-            _queue_worker_data(session_id, chunk)
-    except Exception as exc:
-        print(f"[cf_front] Local client error: {exc}")
-    finally:
-        if session_id is not None:
-            _send_close(session_id)
-            with _sessions_lock:
-                session = _sessions.pop(session_id, None)
-                if session is not None:
-                    worker_session_id = session.get("worker_session_id")
-                    if worker_session_id is not None:
-                        _worker_session_map.pop(worker_session_id, None)
+                if curr_cmd == 2 and curr_payload:
+                    await self.write_callback(curr_payload)
+                elif curr_cmd == 3:
+                    print(f" [Local Client] Closing stream sequence for Conn ID: {self.conn_id}")
+                    await self.close_callback()
+            except (ConnectionResetError, OSError):
+                await self.close_callback()
+                self.buffer.clear()
+                return
+            self.expected_seq += 1
+
+
+def sync_socks5_handshake(proxy_host, proxy_port, target_url_str, username=None, password=None):
+    parsed = urllib.parse.urlparse(target_url_str)
+    target_host = parsed.hostname
+    target_port = parsed.port if parsed.port else (443 if parsed.scheme == "wss" else 80)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(30)
+    sock.connect((proxy_host, proxy_port))
+
+    if username and password:
+        sock.sendall(b'\x05\x02\x00\x02')
+    else:
+        sock.sendall(b'\x05\x01\x00')
+
+    response = sock.recv(2)
+    if len(response) < 2 or response[0] != 0x05:
+        sock.close()
+        raise Exception("Upstream SOCKS5 handshake presentation rejected")
+
+    if response[1] == 0x02:
+        user_bytes = username.encode('utf-8')
+        pass_bytes = password.encode('utf-8')
+        auth_payload = struct.pack('!BB', 0x01, len(user_bytes)) + user_bytes + struct.pack('!B',
+                                                                                            len(pass_bytes)) + pass_bytes
+        sock.sendall(auth_payload)
+        if (sock.recv(2))[1] != 0x00:
+            sock.close()
+            raise Exception("Upstream SOCKS5 authentication failed")
+
+    host_bytes = target_host.encode('utf-8')
+    sock.sendall(
+        struct.pack('!BBBBB', 0x05, 0x01, 0x00, 0x03, len(host_bytes)) + host_bytes + struct.pack('!H', target_port))
+    reply = sock.recv(4)
+    if reply[1] != 0x00:
+        sock.close()
+        raise Exception(f"SOCKS Gateway rejected connection with code {hex(reply[1])}")
+
+    atyp = reply[3]
+    sock.recv(6 if atyp == 1 else (sock.recv(1)[0] + 2 if atyp == 3 else 18))
+    sock.settimeout(None)
+    return sock
+
+
+async def monitor_in_flight_assembly():
+    while True:
+        await asyncio.sleep(0.1)
+        now = asyncio.get_event_loop().time()
+        timeouts = []
+
+        for key, info in list(in_flight_chunks.items()):
+            if now - info['dispatch_time'] > PACKET_FAILURE_TIMEOUT:
+                timeouts.append(key)
+
+        for key in timeouts:
+            info = in_flight_chunks.pop(key, None)
+            if not info: continue
+            chunk = info['chunk']
+            proxy_id = info['proxy_id']
+
+            chunk.penalties[proxy_id] = now + PACKET_FAILURE_TIMEOUT
+            print(f" [!] TIMEOUT: Chunk Seq {chunk.seq_id} on Link [{proxy_id}] expired. Re-queuing...")
+
+            await pending_queue.put(chunk, front=True)
+            safe_release_semaphore(proxy_id)
+
+
+async def handle_local_client(reader, writer):
+    connection_id = random.getrandbits(32)
+    print(f" [+] Local Client Connected: Assigned Conn ID: {connection_id}")
+
+    async def socket_write(data):
+        writer.write(data)
+        await writer.drain()
+
+    async def socket_close():
         try:
-            client_sock.close()
-        except Exception:
+            writer.close()
+            await writer.wait_closed()
+        except:
             pass
+        active_connections.pop(connection_id, None)
 
+    buffer = ReassemblyBuffer(connection_id, socket_write, socket_close)
+    active_connections[connection_id] = buffer
 
-def _start_socks5_listener():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((Local_Host, Local_Port))
-    server.listen()
-    print(f"[cf_front] SOCKS5 listener running on {Local_Host}:{Local_Port}")
-    server.settimeout(1.0)
+    await pending_queue.put(Chunk(connection_id, 1, 0, b""))
+
+    seq_id = 1
     try:
-        while not _stop_event.is_set():
-            try:
-                client_sock, addr = server.accept()
-            except socket.timeout:
-                continue
-            threading.Thread(target=_handle_socks5_client, args=(client_sock, addr), daemon=True).start()
+        while True:
+            data = await reader.read(CHUNK_SIZE)
+            if not data: break
+            await pending_queue.put(Chunk(connection_id, 2, seq_id, data))
+            seq_id += 1
+    except Exception:
+        pass
     finally:
+        await pending_queue.put(Chunk(connection_id, 3, seq_id, b""))
+
+
+async def tunnel_worker(proxy_ip, proxy_port, client_id, user, pwd):
+    url = f"{CLOUDFLARE_BASE_URL}?id={client_id}"
+    loop = asyncio.get_running_loop()
+
+    worker_semaphores[client_id] = asyncio.BoundedSemaphore(CHUNKS_PER_WORKER)
+
+    while True:
         try:
-            server.close()
-        except Exception:
-            pass
+            print(f" [*] Link [{client_id}] dialing SOCKS proxy {proxy_ip}:{proxy_port}...")
+            raw_sock = await loop.run_in_executor(None, sync_socks5_handshake, proxy_ip, proxy_port, url, user, pwd)
+
+            async with websockets.connect(url, max_size=None, sock=raw_sock, open_timeout=60) as websocket:
+                print(f" [v] PIPELINE ACTIVE: Link [{client_id}] established. Window capacity: {CHUNKS_PER_WORKER}")
+
+                async def send_loop():
+                    while True:
+                        if worker_semaphores[client_id]._value == 0:
+                            print(f" [Window Lock] Link [{client_id}] window exhausted! Awaiting ACKs...")
+
+                        await worker_semaphores[client_id].acquire()
+                        chunk = await pending_queue.get(client_id)
+
+                        in_flight_chunks[(chunk.conn_id, chunk.seq_id)] = {
+                            'chunk': chunk,
+                            'dispatch_time': loop.time(),
+                            'proxy_id': client_id
+                        }
+
+                        packet = struct.pack("!IBI", chunk.conn_id, chunk.cmd, chunk.seq_id) + chunk.payload
+                        try:
+                            await websocket.send(packet)
+                            # Light logging to trace pipelining without drowning the terminal
+                            if chunk.seq_id % 5 == 0 or chunk.cmd != 2:
+                                print(
+                                    f" [-> Outbound] Link [{client_id}] pushed Conn: {chunk.conn_id}, Seq: {chunk.seq_id} (Cmd: {chunk.cmd})")
+                        except Exception:
+                            in_flight_chunks.pop((chunk.conn_id, chunk.seq_id), None)
+                            await pending_queue.put(chunk, front=True)
+                            safe_release_semaphore(client_id)
+                            raise
+
+                async def recv_loop():
+                    async_loop = asyncio.get_event_loop()
+                    async for message in websocket:
+                        if len(message) < 9: continue
+                        conn_id, cmd, seq_id = struct.unpack("!IBI", message[:9])
+                        payload = message[9:]
+
+                        if cmd == 5:  # Delivery verified by backend
+                            info = in_flight_chunks.pop((conn_id, seq_id), None)
+                            if info and info['proxy_id'] == client_id:
+                                safe_release_semaphore(client_id)
+                                if seq_id % 5 == 0:
+                                    print(
+                                        f" [ACK Received] Link [{client_id}] verified delivery for Seq: {seq_id}. Window slot released.")
+                        elif cmd in [2, 3]:
+                            await websocket.send(struct.pack("!IBI", conn_id, 5, seq_id))
+                            buf = active_connections.get(conn_id)
+                            if buf:
+                                async_loop.create_task(buf.add_chunk(cmd, seq_id, payload))
+
+                await asyncio.gather(send_loop(), recv_loop())
+        except Exception as e:
+            print(f" [!] Link [{client_id}] error: {e}. Reconnecting in 2s...")
+            for _ in range(CHUNKS_PER_WORKER):
+                safe_release_semaphore(client_id)
+            await asyncio.sleep(2)
 
 
-def start():
-    threading.Thread(target=_ws_receive_loop, daemon=True).start()
-    try:
-        while not _ws_ready.is_set() and not _stop_event.is_set():
-            _ensure_worker_connection()
-            if not _ws_ready.is_set():
-                time.sleep(2)
-        if not _stop_event.is_set():
-            _start_socks5_listener()
-    except KeyboardInterrupt:
-        print("[cf_front] KeyboardInterrupt received, shutting down")
-        _stop_event.set()
-        _reset_ws()
+async def main():
+    print("======================================================================")
+    print("  LAUNCHING HIGH-SPEED SLIDING-WINDOW MULTIPLEX FRONTEND")
+    print("======================================================================")
+    asyncio.create_task(monitor_in_flight_assembly())
+    workers = [tunnel_worker(ip, pt, cid, u, p) for ip, pt, cid, u, p in UPSTREAM_PROXIES]
+    server = await asyncio.start_server(handle_local_client, LOCAL_LISTENER_HOST, LOCAL_LISTENER_PORT)
+    await asyncio.gather(server.serve_forever(), *workers)
 
 
 if __name__ == "__main__":
-    start()
+    asyncio.run(main())
